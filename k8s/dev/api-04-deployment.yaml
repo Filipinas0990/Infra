@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-04
+  namespace: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-04
+  template:
+    metadata:
+      labels:
+        app: api-04
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: api-04
+          image: ghcr.io/kelmordigital/api-04:latest
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - secretRef:
+                name: api-04-secrets
+          resources:
+            requests:
+              cpu: "30m"
+              memory: "96Mi"
+            limits:
+              cpu: "150m"
+              memory: "192Mi"
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 20
