@@ -1,0 +1,74 @@
+# RESTAURAÇÃO do disco da WuzAPI a partir do backup no R2. NÃO aplicar no dia a dia.
+#
+# Passo a passo (KUBECONFIG=~/.kube/kelmor-hetzner.yaml):
+#   1. kubectl -n prod scale deploy/wuzapi --replicas=0          # a WuzAPI precisa estar PARADA
+#   2. (opcional) trocar BACKUP_FILE abaixo por um arquivo específico; vazio = o mais novo
+#   3. kubectl -n prod delete job wuzapi-restore --ignore-not-found
+#      kubectl -n prod apply -f wuzapi-restore-job.yaml
+#      kubectl -n prod logs -f job/wuzapi-restore                 # deve terminar com "Restauração concluída"
+#   4. kubectl -n prod scale deploy/wuzapi --replicas=1
+#   5. kubectl -n prod logs deploy/wuzapi | grep -i "connected"   # sessões voltando sem QR
+#
+# Cluster perdido do zero: recriar antes os Secrets a partir dos arquivos locais (fora do git)
+#   wuzapi.env → wuzapi-secrets, wuzapi-backup.env → wuzapi-backup-secrets, api-04.env → api-04-secrets,
+#   aplicar o PVC (wuzapi-deployment.yaml com replicas: 0) e seguir do passo 2.
+#
+# Os bancos atuais não são apagados: ficam em /data/antes-da-restauracao-<data>/.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wuzapi-restore
+  namespace: prod
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      containers:
+        - name: restore
+          image: alpine:3.20
+          env:
+            - name: BACKUP_FILE
+              value: "" # ex.: wuzapi-20261114-132519.tar.gz.enc
+            - { name: BACKUP_PASSPHRASE, valueFrom: { secretKeyRef: { name: wuzapi-backup-secrets, key: BACKUP_PASSPHRASE } } }
+            - { name: R2_ENDPOINT, valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_ENDPOINT } } }
+            - { name: R2_BUCKET, valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_BUCKET } } }
+            - { name: AWS_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_ACCESS_KEY_ID } } }
+            - { name: AWS_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_SECRET_ACCESS_KEY } } }
+            - { name: AWS_DEFAULT_REGION, value: auto }
+            - { name: AWS_REQUEST_CHECKSUM_CALCULATION, value: when_required }
+            - { name: AWS_RESPONSE_CHECKSUM_VALIDATION, value: when_required }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache -q sqlite openssl aws-cli
+              SRC="s3://$R2_BUCKET/backups/wuzapi"
+              FILE="${BACKUP_FILE:-}"
+              [ -n "$FILE" ] || FILE=$(aws s3 ls "$SRC/" --endpoint-url "$R2_ENDPOINT" | awk '{print $4}' | grep '^wuzapi-.*\.tar\.gz\.enc$' | sort | tail -1)
+              echo "Restaurando: $FILE"
+              mkdir -p /tmp/r && cd /tmp/r
+              aws s3 cp "$SRC/$FILE" b.enc --endpoint-url "$R2_ENDPOINT" --only-show-errors
+              openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:BACKUP_PASSPHRASE -in b.enc | tar -xzf -
+              for db in main users; do
+                [ "$(sqlite3 $db.db 'PRAGMA integrity_check;')" = "ok" ] || { echo "ERRO: $db.db do backup corrompido"; exit 1; }
+              done
+              OLD="/data/antes-da-restauracao-$(date -u +%Y%m%d-%H%M%S)"
+              mkdir -p "$OLD"
+              # Os -wal/-shm pertencem aos bancos antigos: se ficarem, corrompem os restaurados
+              for f in main.db main.db-wal main.db-shm users.db users.db-wal users.db-shm; do
+                [ -e "/data/$f" ] && mv "/data/$f" "$OLD/"
+              done
+              cp main.db users.db /data/
+              echo "Bancos antigos guardados em $OLD"
+              echo "Sessões no backup: $(sqlite3 /data/main.db 'select count(*) from whatsmeow_device;')"
+              echo "Restauração concluída. Agora: kubectl -n prod scale deploy/wuzapi --replicas=1"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: wuzapi-data

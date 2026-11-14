@@ -1,0 +1,82 @@
+# WuzAPI — motor WhatsApp alternativo ao bays (conexões com at_connections.type = 'wuzapi').
+# Sessões no Postgres do db-eu (banco próprio), então o pod não guarda estado.
+# Segredos (Secret wuzapi-secrets, criado fora do git):
+#   WUZAPI_ADMIN_TOKEN, WUZAPI_GLOBAL_ENCRYPTION_KEY (32 bytes), DB_USER, DB_PASSWORD, DB_NAME
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wuzapi
+  namespace: dev
+spec:
+  replicas: 1
+  # Uma sessão WhatsApp só pode estar aberta em um lugar: o pod velho morre antes do novo subir
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wuzapi
+  template:
+    metadata:
+      labels:
+        app: wuzapi
+    spec:
+      # Sem isso o k8s injeta WUZAPI_PORT=tcp://<ip do Service>:8080 (Service se chama "wuzapi"),
+      # que colide com a variável de porta da própria WuzAPI e derruba o processo.
+      enableServiceLinks: false
+      containers:
+        - name: wuzapi
+          image: asternic/wuzapi:1.1.0
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: wuzapi-secrets
+          env:
+            - name: WUZAPI_PORT
+              value: "8080"
+            - name: DB_HOST
+              value: "10.0.0.4"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_SSLMODE
+              value: "disable" # rede privada k3s-net, igual à API
+            - name: WEBHOOK_FORMAT
+              value: "json"
+            - name: TZ
+              value: "America/Sao_Paulo"
+            - name: SESSION_DEVICE_NAME
+              value: "Kelmor"
+            # "available" faz o celular parar de receber notificações; os atendentes usam o celular
+            - name: WUZAPI_AUTO_PRESENCE
+              value: "unavailable"
+            - name: WUZAPI_MEDIA_TMPDIR
+              value: "/tmp"
+            - name: LOG_LEVEL
+              value: "info"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "96Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        # Mídia em trânsito (download/upload) — some com o pod, de propósito
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

@@ -1,0 +1,97 @@
+# WuzAPI (prod) — motor WhatsApp alternativo ao bays.
+# Banco: SQLite em disco persistente (PVC wuzapi-data, local-path) montado em /app/dbdata.
+# Se o PVC for apagado, as sessões somem e é preciso parear de novo.
+# Segredos (Secret wuzapi-secrets, criado fora do git): WUZAPI_ADMIN_TOKEN, WUZAPI_GLOBAL_ENCRYPTION_KEY
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wuzapi-data
+  namespace: prod
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wuzapi
+  namespace: prod
+spec:
+  replicas: 1
+  # Uma sessão WhatsApp só pode estar aberta em um lugar; e o SQLite só aceita um processo
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wuzapi
+  template:
+    metadata:
+      labels:
+        app: wuzapi
+    spec:
+      # Sem isso o k8s injeta WUZAPI_PORT=tcp://<ip do Service>:8080 (Service se chama "wuzapi"),
+      # que colide com a variável de porta da própria WuzAPI e derruba o processo.
+      enableServiceLinks: false
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: wuzapi
+          # Cópia da Kelmor (repo Kelmordigital/wuzapi-kelmor), base v1.1.0. Trocar de versão = trocar o commit aqui.
+          image: ghcr.io/kelmordigital/wuzapi-kelmor:d7824517dc448421d2449db7bb966c61587d5b2d
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: wuzapi-secrets
+          env:
+            - name: WUZAPI_PORT
+              value: "8080"
+            - name: WEBHOOK_FORMAT
+              value: "json"
+            - name: TZ
+              value: "America/Sao_Paulo"
+            - name: SESSION_DEVICE_NAME
+              value: "Kelmor"
+            # "available" faz o celular parar de receber notificações; os atendentes usam o celular
+            - name: WUZAPI_AUTO_PRESENCE
+              value: "unavailable"
+            - name: WUZAPI_MEDIA_TMPDIR
+              value: "/tmp"
+            - name: LOG_LEVEL
+              value: "info"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: data
+              mountPath: /app/dbdata
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: wuzapi-data
+        # Mídia em trânsito (download/upload) — some com o pod, de propósito
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

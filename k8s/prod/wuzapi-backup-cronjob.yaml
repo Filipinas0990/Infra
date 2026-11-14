@@ -1,0 +1,99 @@
+# Backup do disco da WuzAPI (PVC wuzapi-data) para o Cloudflare R2, a cada 6 horas.
+#
+# O disco tem dois bancos SQLite: main.db (chaves das sessões do WhatsApp; perder = ler o QR de novo
+# em todos os números) e users.db (cadastro das conexões). O disco fica só no servidor k3s-kelmor,
+# por isso a cópia vai para fora dele.
+#
+# - Cópia consistente com a WuzAPI rodando: ".backup" do SQLite (não é cópia de arquivo).
+# - Confere a integridade, criptografa (AES-256, senha no Secret wuzapi-backup-secrets, cópia local em
+#   wuzapi-backup.env, fora do git) e testa se o arquivo abre de volta antes de enviar.
+# - Destino: s3://$R2_BUCKET/backups/wuzapi/wuzapi-<data UTC>.tar.gz.enc (credenciais R2 da api-04).
+#   O bucket é público para as mídias; sem a senha o arquivo é inútil.
+# - Guarda as 56 cópias mais novas (14 dias × 4 por dia) e apaga as mais antigas.
+#
+# Rodar agora:   kubectl -n prod create job --from=cronjob/wuzapi-backup wuzapi-backup-manual-$(date +%s)
+# Restaurar:     ver Api-kelmor/regras-de-negocio/wuzapi.md, seção "Backup e restauração".
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: wuzapi-backup
+  namespace: prod
+spec:
+  schedule: "15 */6 * * *" # UTC: 00:15, 06:15, 12:15 e 18:15 (21:15, 03:15, 09:15 e 15:15 em Brasília)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          containers:
+            - name: backup
+              image: alpine:3.20
+              env:
+                - name: KEEP
+                  value: "56"
+                - name: BACKUP_PASSPHRASE
+                  valueFrom: { secretKeyRef: { name: wuzapi-backup-secrets, key: BACKUP_PASSPHRASE } }
+                - name: R2_ENDPOINT
+                  valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_ENDPOINT } }
+                - name: R2_BUCKET
+                  valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_BUCKET } }
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_ACCESS_KEY_ID } }
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom: { secretKeyRef: { name: api-04-secrets, key: R2_SECRET_ACCESS_KEY } }
+                - name: AWS_DEFAULT_REGION
+                  value: auto
+                # O R2 não aceita os checksums que o aws-cli novo manda por padrão
+                - name: AWS_REQUEST_CHECKSUM_CALCULATION
+                  value: when_required
+                - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+                  value: when_required
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  apk add --no-cache -q sqlite openssl aws-cli
+                  TS=$(date -u +%Y%m%d-%H%M%S)
+                  W=/tmp/bk
+                  mkdir -p "$W"
+                  for db in main users; do
+                    sqlite3 "/data/$db.db" ".backup '$W/$db.db'"
+                    check=$(sqlite3 "$W/$db.db" 'PRAGMA integrity_check;')
+                    [ "$check" = "ok" ] || { echo "ERRO: $db.db corrompido na cópia: $check"; exit 1; }
+                    echo "$db.db: $(stat -c %s "$W/$db.db") bytes, integridade ok"
+                  done
+                  tar -C "$W" -czf "$W/wuzapi.tar.gz" main.db users.db
+                  OUT="wuzapi-$TS.tar.gz.enc"
+                  openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:BACKUP_PASSPHRASE \
+                    -in "$W/wuzapi.tar.gz" -out "$W/$OUT"
+                  # Testa se abre de volta com a senha antes de enviar
+                  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:BACKUP_PASSPHRASE \
+                    -in "$W/$OUT" | cmp - "$W/wuzapi.tar.gz"
+                  DEST="s3://$R2_BUCKET/backups/wuzapi"
+                  aws s3 cp "$W/$OUT" "$DEST/$OUT" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+                  echo "Enviado: backups/wuzapi/$OUT ($(stat -c %s "$W/$OUT") bytes)"
+                  # Retenção: mantém as $KEEP mais novas (o nome tem a data, então ordem alfabética = cronológica)
+                  aws s3 ls "$DEST/" --endpoint-url "$R2_ENDPOINT" | awk '{print $4}' | grep '^wuzapi-.*\.tar\.gz\.enc$' | sort \
+                    | awk -v keep="$KEEP" '{a[NR]=$0} END {for (i = 1; i <= NR - keep; i++) print a[i]}' \
+                    | while read -r old; do
+                        aws s3 rm "$DEST/$old" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+                        echo "Apagado (antigo): $old"
+                      done
+                  echo "Backup concluído."
+              resources:
+                requests: { cpu: "20m", memory: "64Mi" }
+                limits: { cpu: "500m", memory: "256Mi" }
+              volumeMounts:
+                # Leitura e escrita: o SQLite em modo WAL precisa do arquivo -shm até para ler
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: wuzapi-data

@@ -1,0 +1,13 @@
+# Só interno: a api-04 chama http://wuzapi:8080. Sem Ingress (nada exposto na internet).
+apiVersion: v1
+kind: Service
+metadata:
+  name: wuzapi
+  namespace: prod
+spec:
+  type: ClusterIP
+  selector:
+    app: wuzapi
+  ports:
+    - port: 8080
+      targetPort: 8080
